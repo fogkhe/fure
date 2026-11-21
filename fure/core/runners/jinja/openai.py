@@ -2,6 +2,7 @@ import asyncio
 import json
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from time import monotonic
 from uuid import UUID
 
@@ -15,11 +16,11 @@ from openai.types.shared_params.response_format_json_schema import (
 from referencing import Registry
 
 from fure.core.implementations import JinjaImplementation
-from fure.core.run import SucceedRunMeta
+from fure.core.run import RunAssistantComment, SucceedRunMeta
 from fure.core.runners.base import RunResult
 from fure.core.runners.jinja.base import BaseJinjaRunner, BaseJinjaRunnerOptions
 from fure.core.types import JSONSchema, JSONValue
-from fure.utils.json_extraction import extract_json, parse_json
+from fure.utils.json_extraction import extract_json, parse_json, strip_reasoning
 
 DEFAULT_MAX_STEPS = 8
 DEFAULT_MAX_TOOL_CALLS = 16
@@ -61,7 +62,7 @@ class OpenAIJinjaTool:
     name: str
     description: str | None
     input_schema: JSONSchema
-    execute: Callable[[dict[str, JSONValue] | None, int], Awaitable[JSONValue]]
+    execute: Callable[[dict[str, JSONValue] | None, int, int], Awaitable[JSONValue]]
 
     @property
     def parameters(self) -> JSONSchema:
@@ -78,6 +79,7 @@ async def _call_tool(
     call: ChatCompletionMessageFunctionToolCall,
     tools: dict[str, OpenAIJinjaTool],
     index: int,
+    step: int,
 ) -> dict[str, str]:
     tool = tools.get(call.function.name)
     if tool is None:
@@ -93,7 +95,7 @@ async def _call_tool(
         except TypeError, ValueError, ValidationError:
             output = {"error": {"code": "invalid_input"}}
         else:
-            output = await tool.execute(None if null_input else arguments, index)
+            output = await tool.execute(None if null_input else arguments, index, step)
     return {
         "role": "tool",
         "tool_call_id": call.id,
@@ -115,6 +117,7 @@ class OpenAIJinjaRunner(
         *,
         variables: dict[str, JSONValue] | None = None,
         tools: tuple[OpenAIJinjaTool, ...] | None = None,
+        report_comment: Callable[[RunAssistantComment], Awaitable[None]] | None = None,
     ) -> RunResult[OpenAIJinjaRunMeta]:
         options = options if options is not None else self._options
         if tools is None and options.tool_function_ids:
@@ -139,23 +142,33 @@ class OpenAIJinjaRunner(
 
         prompt = implementation.render(input, variables=variables)
 
-        messages = []
+        available = {tool.name: tool for tool in tools or ()}
+        instructions = []
+        if available:
+            instructions.append(
+                "Tool calls in the same assistant response run in parallel. "
+                "Only group independent calls. If a call needs another tool's "
+                "result or must happen after that tool finishes, request the "
+                "prerequisite first. Wait for its tool result before requesting "
+                "the dependent call in a later response. For a strictly ordered "
+                "sequence, request only the next call in each response."
+            )
         if json_output:
             instruction = "The final output must conform to the schema."
             if not structured_output:
                 instruction = (
-                    "Return exactly one JSON value matching this JSON Schema. "
-                    "Do not include explanations or Markdown.\n"
+                    "Return exactly one JSON value matching this JSON Schema in your final response. "
+                    "Do not include explanations or Markdown in the final response.\n"
                     + json.dumps(output_schema, ensure_ascii=False)
                 )
-            messages.append(
-                {"role": "system", "content": instruction},
-            )
+            instructions.append(instruction)
+        messages = []
+        if instructions:
+            messages.append({"role": "system", "content": "\n\n".join(instructions)})
         messages.append(
             {"role": "user", "content": prompt},
         )
 
-        available = {tool.name: tool for tool in tools or ()}
         tool_definitions = [
             {
                 "type": "function",
@@ -171,6 +184,7 @@ class OpenAIJinjaRunner(
         call_count = 0
         seen_call_ids: set[str] = set()
         usages = []
+        comments = []
         async with AsyncOpenAI(
             api_key=options.api_key if options.api_key is not None else "none",
             base_url=options.base_url,
@@ -217,6 +231,16 @@ class OpenAIJinjaRunner(
                     raise AgentLimitExceeded(
                         "Agent reached the maximum number of tool calls"
                     )
+                text = strip_reasoning(
+                    message.content or "", options.reasoning_end_tags
+                )
+                if text:
+                    comment = RunAssistantComment(
+                        text=text, step=steps, received_at=datetime.now(UTC)
+                    )
+                    comments.append(comment)
+                    if report_comment is not None:
+                        await report_comment(comment)
                 assistant = message.model_dump(
                     include={"role", "content", "tool_calls", "reasoning_content"},
                     exclude_none=True,
@@ -224,7 +248,7 @@ class OpenAIJinjaRunner(
                 messages.append(assistant)
                 async with asyncio.TaskGroup() as group:
                     tasks = [
-                        group.create_task(_call_tool(call, available, index))
+                        group.create_task(_call_tool(call, available, index, steps))
                         for index, call in enumerate(calls, start=call_count + 1)
                     ]
                 messages.extend(task.result() for task in tasks)
@@ -273,6 +297,7 @@ class OpenAIJinjaRunner(
                 input_tokens=total("prompt_tokens"),
                 output_tokens=total("completion_tokens"),
                 total_tokens=total("total_tokens"),
+                assistant_comments=tuple(comments),
             ),
             duration=monotonic() - start_time,
         )

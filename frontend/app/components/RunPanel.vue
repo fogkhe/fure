@@ -2,7 +2,7 @@
 import type { FunctionRecord, JsonObject, JsonValue, RunRecord, RunResult } from '~/types/api'
 import { inputSchema, invalidInputFields, isJsonObject, parseInputJson } from '~/utils/inputSchema'
 
-const { formatDuration, errorMessage, translateDetail } = useFormatting()
+const { formatDate, formatDuration, errorMessage, translateDetail } = useFormatting()
 const { t } = useI18n()
 
 const props = defineProps<{
@@ -61,6 +61,11 @@ const cancelOpen = ref(false)
 const canCancel = computed(() => auth.can('runs.read') && auth.can('runs.cancel'))
 const error = ref('')
 const result = shallowRef<RunResult | null>(null)
+const currentRun = shallowRef<RunRecord | null>(null)
+const runMeta = computed(() => currentRun.value?.meta ?? result.value?.meta)
+const toolCalls = computed(() => runMeta.value?.tool_calls ?? [])
+const assistantComments = computed(() => runMeta.value?.assistant_comments ?? [])
+const hasProgress = computed(() => toolCalls.value.length > 0 || assistantComments.value.length > 0)
 const runId = ref<string | null>(null)
 const showSchema = ref(false)
 let controller: AbortController | undefined
@@ -80,6 +85,7 @@ async function execute() {
     return
   error.value = ''
   result.value = null
+  currentRun.value = null
   runId.value = null
   cancelled.value = false
   cancelling.value = false
@@ -99,9 +105,11 @@ async function execute() {
     const endpoint = `/functions/${props.record.id}/run`
     if (auth.can('runs.read')) {
       let run = await api<RunRecord>(endpoint, { method: 'POST', query: { wait: false }, body: { input: value }, signal })
+      currentRun.value = run
       runId.value = run.id
       while (run.status === 'pending' || run.status === 'running') {
         run = await api<RunRecord>(`/runs/${run.id}`, { signal })
+        currentRun.value = run
         if (run.status === 'pending' || run.status === 'running') {
           await new Promise(resolve => setTimeout(resolve, 500))
           signal.throwIfAborted()
@@ -280,29 +288,99 @@ onBeforeUnmount(() => controller?.abort())
           icon="i-lucide-circle-alert"
           color="error"
         />
-        <template v-if="result">
-          <div class="flex flex-wrap items-center gap-3">
-            <StatusBadge status="succeeded" /><span class="text-sm text-muted">{{ formatDuration(result.duration) }}</span><UBadge
-              v-if="result.meta.total_tokens != null"
-              color="neutral"
-              variant="subtle"
-            >
-              {{ t('counts.tokens', result.meta.total_tokens) }}
-            </UBadge>
-          </div>
-          <JsonView
-            :value="result.output"
-            :title="t('ui.result')"
-            text
-          />
-          <JsonView
-            v-if="Object.keys(result.meta).length"
-            :value="result.meta"
-            :title="t('ui.metadata')"
-          />
-        </template>
+        <div
+          v-if="result"
+          class="flex flex-wrap items-center gap-3"
+        >
+          <StatusBadge status="succeeded" />
+          <span class="text-sm text-muted">{{ formatDuration(result.duration) }}</span>
+          <UBadge
+            v-if="result.meta.total_tokens != null"
+            color="neutral"
+            variant="subtle"
+          >
+            {{ t('counts.tokens', result.meta.total_tokens) }}
+          </UBadge>
+        </div>
+        <StatusBadge
+          v-else-if="running && hasProgress"
+          status="running"
+        />
+        <JsonView
+          v-if="result || hasProgress"
+          :value="result?.output"
+          :title="t('ui.result')"
+          :hide-value="!result"
+          text
+        >
+          <section
+            v-if="assistantComments.length"
+            class="space-y-3 p-4"
+            :class="{ 'border-t border-default': result }"
+          >
+            <h3 class="text-sm font-medium text-highlighted">
+              {{ t('agent.assistantComments') }}
+            </h3>
+            <ul class="space-y-2">
+              <li
+                v-for="(comment, index) in assistantComments"
+                :key="index"
+                class="rounded-md bg-elevated p-2.5"
+              >
+                <div
+                  v-if="comment.step != null || comment.received_at"
+                  class="mb-1 flex flex-wrap gap-x-3 text-xs text-muted"
+                >
+                  <span v-if="comment.step != null">{{ t('agent.step', { step: comment.step }) }}</span>
+                  <time
+                    v-if="comment.received_at"
+                    :datetime="comment.received_at"
+                  >{{ formatDate(comment.received_at, 'medium') }}</time>
+                </div>
+                <p class="text-sm wrap-break-word whitespace-pre-wrap">
+                  {{ comment.text }}
+                </p>
+              </li>
+            </ul>
+          </section>
+          <section
+            v-if="toolCalls.length"
+            class="space-y-3 p-4"
+            :class="{ 'border-t border-default': result || assistantComments.length }"
+          >
+            <h3 class="text-sm font-medium text-highlighted">
+              {{ t('agent.toolCalls') }}
+            </h3>
+            <ol class="space-y-3">
+              <li
+                v-for="call in toolCalls"
+                :key="call.run_id"
+                class="space-y-1.5"
+              >
+                <div class="text-xs break-all">
+                  <span class="text-muted">{{ call.index }}.</span>
+                  <code class="ml-1 font-medium text-highlighted">{{ call.name }}</code>
+                  <span
+                    v-if="call.step != null"
+                    class="ml-2 text-muted"
+                  >{{ t('agent.step', { step: call.step }) }}</span>
+                </div>
+                <CodeBlock
+                  :source="JSON.stringify(call.arguments, null, 2)"
+                  language="json"
+                  class="overflow-auto rounded-md bg-elevated p-2.5 text-xs"
+                />
+              </li>
+            </ol>
+          </section>
+        </JsonView>
+        <JsonView
+          v-if="runMeta && Object.keys(runMeta).length"
+          :value="runMeta"
+          :title="t('ui.metadata')"
+        />
         <UEmpty
-          v-else-if="!error && !cancelled"
+          v-if="!result && !hasProgress && !error && !cancelled"
           :icon="running ? 'i-lucide-loader-circle' : 'i-lucide-terminal'"
           :title="running ? t('ui.functionIsRunning') : t('ui.theResultWillAppearHere')"
           :description="running ? t('ui.waitingForAResponseFromTheSelectedImplementation') : t('ui.enterInputDataAndRunTheFunction')"

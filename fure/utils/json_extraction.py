@@ -34,20 +34,25 @@ def parse_json(text: str) -> JSONValue:
     return DECODER.decode(text)
 
 
+def strip_reasoning(text: str, reasoning_end_tags: tuple[str, ...]) -> str:
+    # Only explicitly configured markers are stripped. An empty list disables it.
+    end = max(
+        (
+            match.end()
+            for tag in reasoning_end_tags
+            for match in re.finditer(re.escape(tag), text, re.IGNORECASE)
+        ),
+        default=0,
+    )
+    return text[end:].strip()
+
+
 def extract_json(text: str, reasoning_end_tags: tuple[str, ...] = ()) -> JSONValue:
     try:
         return parse_json(text.strip())
     except ValueError:
         pass
-    # Only explicitly configured markers are stripped. An empty list disables it.
-    endings = [
-        match.end()
-        for tag in reasoning_end_tags
-        for match in re.finditer(re.escape(tag), text, re.IGNORECASE)
-    ]
-    if endings:
-        text = text[max(endings) :]
-    text = text.strip()
+    text = strip_reasoning(text, reasoning_end_tags)
     try:
         return parse_json(text)
     except ValueError, json.JSONDecodeError:

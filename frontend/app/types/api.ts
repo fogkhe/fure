@@ -46,9 +46,24 @@ export interface RevisionRecord {
 }
 
 export type RunStatus = 'pending' | 'running' | 'succeeded' | 'failed' | 'cancelled'
+export interface RunToolCall {
+  index: number
+  step?: number
+  function_id: string
+  name: string
+  arguments: JsonObject
+  run_id: string
+}
+
+export interface RunAssistantComment {
+  text: string
+  step: number | null
+  received_at: string | null
+}
+
 export interface RunResult {
   output: JsonValue
-  meta: { input_tokens?: number | null, output_tokens?: number | null, total_tokens?: number | null }
+  meta: { input_tokens?: number | null, output_tokens?: number | null, total_tokens?: number | null, tool_calls?: RunToolCall[], assistant_comments?: RunAssistantComment[] }
   duration: number
 }
 

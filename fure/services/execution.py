@@ -14,7 +14,14 @@ from sqlalchemy import and_, or_, select, update
 from fure.core.auth import Permission, Principal
 from fure.core.errors import InputValidationError
 from fure.core.revision import Revision
-from fure.core.run import CancelRunMeta, ErrorRunMeta, Run, RunStatus
+from fure.core.run import (
+    CancelRunMeta,
+    ErrorRunMeta,
+    Run,
+    RunAssistantComment,
+    RunStatus,
+    RunToolCall,
+)
 from fure.core.runners import (
     InlinePythonRunner,
     OpenAIJinjaRunner,
@@ -56,6 +63,7 @@ class ToolInvocation:
     parent_run_id: UUID
     index: int
     ancestors: frozenset[UUID]
+    step: int
 
 
 class ExecutionService:
@@ -93,18 +101,12 @@ class ExecutionService:
         try:
             now = datetime.now(UTC)
             async with self.database.sessions.begin() as session:
-                await session.execute(
-                    update(RunRow)
-                    .where(
-                        RunRow.worker_id == self.worker_id,
-                        RunRow.status.in_(ACTIVE_STATUSES),
-                    )
-                    .values(
-                        status=RunStatus.CANCELLED.value,
-                        meta=meta_to_data(CancelRunMeta()),
-                        finished_at=now,
-                        updated_at=now,
-                    )
+                await RunRepository(session).finish_active(
+                    RunRow.worker_id == self.worker_id,
+                    status=RunStatus.CANCELLED.value,
+                    meta=CancelRunMeta(),
+                    finished_at=now,
+                    updated_at=now,
                 )
         finally:
             for task in tasks:
@@ -182,6 +184,18 @@ class ExecutionService:
                 tool_call_index=invocation.index if invocation else None,
             )
             await runs.add(run, self.worker_id)
+            if invocation is not None:
+                await runs.record_tool_call(
+                    invocation.parent_run_id,
+                    RunToolCall(
+                        index=invocation.index,
+                        function_id=function.id,
+                        name=revision.function.name,
+                        arguments=run.input or {},
+                        run_id=run.id,
+                        step=invocation.step,
+                    ),
+                )
         if self._closing:
             await self._cancel_record(run.id)
             raise Unavailable("Application is shutting down", run_id=run.id)
@@ -267,6 +281,7 @@ class ExecutionService:
         ancestors: frozenset[UUID],
         input: dict[str, JSONValue] | None,
         index: int,
+        step: int,
     ) -> JSONValue:
         try:
             # Resolve a submission already in progress before cancelling its run.
@@ -276,7 +291,7 @@ class ExecutionService:
                     input,
                     principal,
                     invocation=ToolInvocation(
-                        revision, parent_run_id, index, ancestors
+                        revision, parent_run_id, index, ancestors, step
                     ),
                 )
             )
@@ -332,13 +347,12 @@ class ExecutionService:
             repository = RunRepository(session)
             values = {
                 "status": RunStatus.CANCELLED.value,
-                "meta": meta_to_data(CancelRunMeta()),
+                "meta": CancelRunMeta(),
                 "finished_at": now,
                 "updated_at": now,
             }
-            changed = await repository.transition(
-                id,
-                ACTIVE_STATUSES,
+            changed = await repository.finish_active(
+                RunRow.id == id,
                 **values,
             )
             if changed:
@@ -350,6 +364,15 @@ class ExecutionService:
                 ):
                     raise NotFound("Run not found")
                 raise Conflict("Run has already finished")
+
+    async def _record_assistant_comment(
+        self, run_id: UUID, comment: RunAssistantComment
+    ) -> None:
+        async with self.database.sessions.begin() as session:
+            if not await RunRepository(session).record_assistant_comment(
+                run_id, comment
+            ):
+                raise asyncio.CancelledError
 
     async def _perform(
         self, run: Run, principal: Principal | None, ancestors: frozenset[UUID]
@@ -385,16 +408,24 @@ class ExecutionService:
                             run, options, principal, ancestors
                         )
                     result = await OpenAIJinjaRunner(options).run(
-                        implementation, run.input, variables=variables, tools=tools
+                        implementation,
+                        run.input,
+                        variables=variables,
+                        tools=tools,
+                        report_comment=partial(self._record_assistant_comment, run.id),
                     )
                 else:
                     result = await InlinePythonRunner(options).run(
                         implementation, run.input, variables=variables
                     )
             json.dumps(result.output, allow_nan=False)
-            run.succeed(result.output, result.meta, result.duration)
             async with self.database.sessions.begin() as session:
-                changed = await RunRepository(session).transition(
+                runs = RunRepository(session)
+                meta = result.meta
+                if self._uses_tools(options):
+                    meta = meta.with_progress(await runs.get_meta(run.id))
+                run.succeed(result.output, meta, result.duration)
+                changed = await runs.transition(
                     run.id,
                     [RunStatus.RUNNING.value],
                     status=run.status.value,
@@ -442,11 +473,10 @@ class ExecutionService:
                 )
             now = datetime.now(UTC)
             async with self.database.sessions.begin() as session:
-                changed = await RunRepository(session).transition(
-                    run.id,
-                    ACTIVE_STATUSES,
+                changed = await RunRepository(session).finish_active(
+                    RunRow.id == run.id,
                     status=RunStatus.FAILED.value,
-                    meta=meta_to_data(ErrorRunMeta(failure.code, str(failure))),
+                    meta=ErrorRunMeta(failure.code, str(failure)),
                     duration=max(0, monotonic() - start),
                     finished_at=now,
                     updated_at=now,
@@ -460,30 +490,18 @@ class ExecutionService:
     async def _reap_stale(self) -> None:
         now = datetime.now(UTC)
         async with self.database.sessions.begin() as session:
-            await session.execute(
-                update(RunRow)
-                .where(
-                    RunRow.status.in_(ACTIVE_STATUSES),
-                    or_(
-                        RunRow.heartbeat_at
-                        < now - timedelta(seconds=self.lease_seconds),
-                        and_(
-                            RunRow.heartbeat_at.is_(None),
-                            RunRow.created_at
-                            < now - timedelta(seconds=self.lease_seconds),
-                        ),
+            await RunRepository(session).finish_active(
+                or_(
+                    RunRow.heartbeat_at < now - timedelta(seconds=self.lease_seconds),
+                    and_(
+                        RunRow.heartbeat_at.is_(None),
+                        RunRow.created_at < now - timedelta(seconds=self.lease_seconds),
                     ),
-                )
-                .values(
-                    status=RunStatus.FAILED.value,
-                    meta=meta_to_data(
-                        ErrorRunMeta(
-                            "worker_lost", "Execution worker stopped responding"
-                        )
-                    ),
-                    finished_at=now,
-                    updated_at=now,
-                )
+                ),
+                status=RunStatus.FAILED.value,
+                meta=ErrorRunMeta("worker_lost", "Execution worker stopped responding"),
+                finished_at=now,
+                updated_at=now,
             )
 
     async def _monitor(self) -> None:

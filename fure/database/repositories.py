@@ -1,3 +1,4 @@
+from dataclasses import replace
 from datetime import UTC, datetime
 from uuid import UUID
 
@@ -7,10 +8,18 @@ from sqlalchemy.orm import joinedload, selectinload
 
 from fure.core.function import Function
 from fure.core.revision import Revision
-from fure.core.run import Run, RunStatus
+from fure.core.run import (
+    BaseRunMeta,
+    Run,
+    RunAssistantComment,
+    RunningRunMeta,
+    RunStatus,
+    RunToolCall,
+)
 from fure.database.mappers import (
     function_from_row,
     implementation_to_data,
+    meta_from_data,
     meta_to_data,
     options_to_data,
     revision_from_row,
@@ -270,18 +279,61 @@ class RunRepository:
         )
         return result.rowcount == 1
 
-    async def cancel_descendants(self, id: UUID, **values) -> None:
+    async def get_meta(self, id: UUID) -> BaseRunMeta | None:
+        data = await self.session.scalar(select(RunRow.meta).where(RunRow.id == id))
+        return meta_from_data(data)
+
+    async def _save_progress(self, id: UUID, meta: BaseRunMeta) -> bool:
+        return await self.transition(
+            id,
+            [RunStatus.RUNNING.value],
+            meta=meta_to_data(meta),
+            updated_at=datetime.now(UTC),
+        )
+
+    async def record_assistant_comment(
+        self, id: UUID, comment: RunAssistantComment
+    ) -> bool:
+        progress = await self.get_meta(id) or RunningRunMeta()
+        return await self._save_progress(
+            id,
+            replace(
+                progress, assistant_comments=(*progress.assistant_comments, comment)
+            ),
+        )
+
+    async def record_tool_call(self, parent_id: UUID, call: RunToolCall) -> None:
+        # Submission has already locked the parent row in this transaction.
+        progress = await self.get_meta(parent_id) or RunningRunMeta()
+        calls = tuple(
+            sorted((*progress.tool_calls, call), key=lambda entry: entry.index)
+        )
+        await self._save_progress(parent_id, replace(progress, tool_calls=calls))
+
+    async def finish_active(self, *filters, meta: BaseRunMeta, **values) -> list[UUID]:
+        rows = (
+            await self.session.execute(
+                update(RunRow)
+                .where(RunRow.status.in_(ACTIVE_STATUSES), *filters)
+                .values(**values)
+                .returning(RunRow.id, RunRow.meta)
+            )
+        ).all()
+        if rows:
+            updates = []
+            for id, data in rows:
+                final = meta.with_progress(meta_from_data(data))
+                updates.append({"id": id, "meta": meta_to_data(final)})
+            await self.session.execute(update(RunRow), updates)
+        return [id for id, _ in rows]
+
+    async def cancel_descendants(
+        self, id: UUID, *, meta: BaseRunMeta, **values
+    ) -> None:
         # Cancel each level before reading the next. A child submission locks its parent
         # before inserting, so a descendant cannot be registered behind this traversal.
         parents = [id]
         while parents:
-            changed = await self.session.scalars(
-                update(RunRow)
-                .where(
-                    RunRow.parent_run_id.in_(parents),
-                    RunRow.status.in_(ACTIVE_STATUSES),
-                )
-                .values(**values)
-                .returning(RunRow.id)
+            parents = await self.finish_active(
+                RunRow.parent_run_id.in_(parents), meta=meta, **values
             )
-            parents = list(changed)

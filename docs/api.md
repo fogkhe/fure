@@ -81,6 +81,22 @@ its own revision, status, output and metadata. Query
 `GET /v1/runs?parent_run_id={run_id}` for direct tool runs in `tool_call_index`
 order. History uses the existing owner, permission and API-key scope checks.
 
+Each accepted tool call is also saved immediately in the parent run’s
+`meta.tool_calls`, with `index`, `name`, `arguments`, `function_id` and `run_id`.
+The current list is available from `GET /v1/runs/{id}` while the agent is
+running and remains in history after it finishes. Successful synchronous
+responses include the list in their metadata. API keys can see only entries
+for functions in their selection.
+
+When an assistant response contains both text and tool calls, the text is
+published in `meta.assistant_comments` as `{ "text": "…", "step": 1,
+"received_at": "2026-11-21T06:27:50Z" }` and the agent continues with the calls.
+Tool calls from the same model response share the same `step`. The step
+number is one-based within the parent run. `received_at` is the UTC time when
+Fure received the response. Historical comments can have null timing fields.
+The final answer remains in `output`. Provider reasoning fields are excluded
+from the comments.
+
 ## Shared variables
 
 The Variables tab uses `/v1/variables`. A create request contains `name`,

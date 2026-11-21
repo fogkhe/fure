@@ -46,7 +46,7 @@ class RunMetaTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(run.meta, SucceedRunMeta)
         self.assertIsInstance(run.meta, BaseRunMeta)
         self.assertEqual(run.meta, result.meta)
-        self.assertEqual(asdict(run.meta), {})
+        self.assertEqual(asdict(run.meta), {"tool_calls": (), "assistant_comments": ()})
 
     def test_fail_and_cancel_accept_their_metadata(self):
         for started in (False, True):
@@ -76,7 +76,13 @@ class RunMetaTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(run.meta.total_tokens, 8)
         self.assertEqual(
             asdict(run.meta),
-            {"input_tokens": 5, "output_tokens": 3, "total_tokens": 8},
+            {
+                "input_tokens": 5,
+                "output_tokens": 3,
+                "total_tokens": 8,
+                "tool_calls": (),
+                "assistant_comments": (),
+            },
         )
 
     def test_metadata_subclass_keeps_defensive_copy_behavior(self):

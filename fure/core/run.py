@@ -1,9 +1,11 @@
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import TYPE_CHECKING, Self
+from typing import TYPE_CHECKING, Annotated, Self
 from uuid import UUID, uuid7
+
+from pydantic import Field
 
 from fure.core.types import JSONValue
 from fure.utils.datetime import normalize_datetime
@@ -13,7 +15,43 @@ if TYPE_CHECKING:
 
 
 @dataclass(frozen=True, slots=True)
-class BaseRunMeta: ...
+class RunAssistantComment:
+    text: str
+    step: int | None
+    received_at: datetime | None
+
+
+@dataclass(frozen=True, slots=True)
+class RunToolCall:
+    index: int
+    function_id: UUID
+    name: str
+    arguments: dict[str, JSONValue]
+    run_id: UUID
+    step: Annotated[int | None, Field(exclude_if=lambda step: step is None)] = None
+
+
+@dataclass(frozen=True, slots=True)
+class BaseRunMeta:
+    tool_calls: Annotated[
+        tuple[RunToolCall, ...], Field(exclude_if=lambda calls: not calls)
+    ] = field(default=(), kw_only=True)
+    assistant_comments: Annotated[
+        tuple[RunAssistantComment, ...], Field(exclude_if=lambda comments: not comments)
+    ] = field(default=(), kw_only=True)
+
+    def with_progress(self, progress: BaseRunMeta | None) -> Self:
+        if progress is None:
+            return self
+        return replace(
+            self,
+            tool_calls=progress.tool_calls,
+            assistant_comments=progress.assistant_comments,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class RunningRunMeta(BaseRunMeta): ...
 
 
 @dataclass(frozen=True, slots=True)

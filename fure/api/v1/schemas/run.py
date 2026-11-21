@@ -3,12 +3,18 @@ from uuid import UUID
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, JsonValue
 
 from fure.api.v1.schemas.common import PaginationRequest, RequestSchema
-from fure.core.run import CancelRunMeta, ErrorRunMeta, FailRunMeta, RunStatus
+from fure.core.run import (
+    CancelRunMeta,
+    ErrorRunMeta,
+    FailRunMeta,
+    RunningRunMeta,
+    RunStatus,
+)
 from fure.core.runners.jinja.openai import OpenAIJinjaRunMeta
 from fure.core.runners.python.inline import InlinePythonRunMeta
 
 type SuccessMeta = OpenAIJinjaRunMeta | InlinePythonRunMeta
-type RunMeta = SuccessMeta | ErrorRunMeta | FailRunMeta | CancelRunMeta
+type RunMeta = SuccessMeta | ErrorRunMeta | FailRunMeta | CancelRunMeta | RunningRunMeta
 
 
 class RunRequest(RequestSchema):

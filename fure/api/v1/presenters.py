@@ -1,4 +1,7 @@
+from dataclasses import replace
+
 from fure.api.v1.schemas import FunctionResponse, RevisionResponse, RunDetailResponse
+from fure.core.auth import Principal
 from fure.core.runners.jinja.openai import OpenAIJinjaRunnerOptions
 from fure.database.mappers import implementation_to_data, options_to_data
 
@@ -41,7 +44,22 @@ def revision_response(revision):
     )
 
 
-def run_response(run):
+def run_response(run, principal: Principal | None = None):
+    meta = run.meta
+    if (
+        meta is not None
+        and meta.tool_calls
+        and principal is not None
+        and principal.key_id is not None
+    ):
+        meta = replace(
+            meta,
+            tool_calls=tuple(
+                call
+                for call in meta.tool_calls
+                if principal.allows_function(call.function_id)
+            ),
+        )
     return RunDetailResponse(
         id=run.id,
         function_id=run.revision.function.id,
@@ -54,7 +72,7 @@ def run_response(run):
         input=run.input,
         status=run.status,
         output=run.output,
-        meta=run.meta,
+        meta=meta,
         duration=run.duration,
         started_at=run.started_at,
         finished_at=run.finished_at,

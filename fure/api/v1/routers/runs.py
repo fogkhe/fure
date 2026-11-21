@@ -29,11 +29,12 @@ router = APIRouter()
 async def list_runs(
     request: Annotated[RunListRequest, Query()],
     service: RunServiceDep,
+    principal: PrincipalDep,
 ) -> PaginationResponse[RunDetailResponse]:
     """List runs, newest first. With parent_run_id, list tool runs in call order."""
     items, total = await service.list(**request.model_dump())
     return PaginationResponse(
-        items=[run_response(item) for item in items],
+        items=[run_response(item, principal) for item in items],
         total=total,
         page=request.page,
         size=request.size,
@@ -49,9 +50,10 @@ async def list_runs(
 async def get_run(
     run_id: Annotated[UUID, Path()],
     service: RunServiceDep,
+    principal: PrincipalDep,
 ) -> RunDetailResponse:
     """Get input, output, metadata, status and timestamps for a specific run."""
-    return run_response(await service.get(run_id))
+    return run_response(await service.get(run_id), principal)
 
 
 @router.post(
@@ -68,4 +70,4 @@ async def cancel_run(
     service: ExecutionServiceDep,
     principal: PrincipalDep,
 ) -> RunDetailResponse:
-    return run_response(await service.cancel(run_id, principal=principal))
+    return run_response(await service.cancel(run_id, principal=principal), principal)

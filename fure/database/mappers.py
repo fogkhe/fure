@@ -1,4 +1,5 @@
 from dataclasses import asdict
+from datetime import datetime
 from uuid import UUID
 
 from fure.core.function import Function
@@ -11,7 +12,10 @@ from fure.core.run import (
     ErrorRunMeta,
     FailRunMeta,
     Run,
+    RunAssistantComment,
+    RunningRunMeta,
     RunStatus,
+    RunToolCall,
     SucceedRunMeta,
 )
 from fure.core.runners.base import BaseRunnerOptions
@@ -73,6 +77,7 @@ META_TYPES = {
     "error": ErrorRunMeta,
     "fail": FailRunMeta,
     "cancel": CancelRunMeta,
+    "running": RunningRunMeta,
     "succeed": SucceedRunMeta,
 }
 
@@ -82,7 +87,30 @@ def meta_to_data(meta: BaseRunMeta | None) -> dict | None:
         return None
     for kind, cls in META_TYPES.items():
         if type(meta) is cls:
-            return {"type": kind, **asdict(meta)}
+            fields = asdict(meta)
+            calls = fields.pop("tool_calls")
+            fields.pop("assistant_comments")
+            if meta.assistant_comments:
+                fields["assistant_comments"] = [
+                    {
+                        "text": comment.text,
+                        "step": comment.step,
+                        "received_at": comment.received_at.isoformat()
+                        if comment.received_at is not None
+                        else None,
+                    }
+                    for comment in meta.assistant_comments
+                ]
+            if calls:
+                fields["tool_calls"] = [
+                    {
+                        **call,
+                        "function_id": str(call["function_id"]),
+                        "run_id": str(call["run_id"]),
+                    }
+                    for call in calls
+                ]
+            return {"type": kind, **fields}
     raise TypeError("Unsupported run metadata type")
 
 
@@ -90,7 +118,43 @@ def meta_from_data(data: dict | None) -> BaseRunMeta | None:
     if data is None:
         return None
     cls = META_TYPES[data["type"]]
-    return cls(**{key: value for key, value in data.items() if key != "type"})
+    fields = {
+        key: value
+        for key, value in data.items()
+        if key not in {"type", "tool_calls", "assistant_comments"}
+    }
+    calls = tuple(
+        RunToolCall(
+            **{
+                **call,
+                "function_id": UUID(call["function_id"]),
+                "run_id": UUID(call["run_id"]),
+            }
+        )
+        for call in data.get("tool_calls", ())
+    )
+    comments = []
+    for entry in data.get("assistant_comments", ()):
+        if isinstance(entry, str):
+            comments.append(
+                RunAssistantComment(text=entry, step=None, received_at=None)
+            )
+        else:
+            received_at = entry["received_at"]
+            comments.append(
+                RunAssistantComment(
+                    text=entry["text"],
+                    step=entry["step"],
+                    received_at=datetime.fromisoformat(received_at)
+                    if received_at is not None
+                    else None,
+                )
+            )
+    return cls(
+        tool_calls=calls,
+        assistant_comments=tuple(comments),
+        **fields,
+    )
 
 
 def function_from_row(row: FunctionRow, *, include_revision=True) -> Function:

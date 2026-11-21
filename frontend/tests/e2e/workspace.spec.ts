@@ -277,21 +277,26 @@ test('Jinja editor derives input schema and stores structured output options', a
   await expect(item.getByLabel('Имя поля', { exact: true })).toHaveValue('greeting')
 })
 
-test('configure tools and follow their runs from an agent', async ({ page, request }) => {
-  const { record: tool } = await seed(request, 'tool_ui_lookup', 'async def function(input: None) -> str: return "tool-result"')
+test('see model comments and tool arguments while the agent runs', async ({ page, request }) => {
+  const { record: tool } = await seed(request, 'tool_ui_lookup', python)
   const created = await request.post('/api/v1/functions', { data: { name: 'agent_ui' } })
   expect(created.ok()).toBeTruthy()
   const agent = await created.json()
+  let finishResponse: () => void = () => {}
+  const finish = new Promise<void>((resolve) => {
+    finishResponse = resolve
+  })
   const provider = createServer(async (incoming, response) => {
     const body = []
     for await (const chunk of incoming) body.push(chunk)
     const { messages } = JSON.parse(Buffer.concat(body).toString())
     const done = messages.at(-1).role === 'tool'
+    if (done) await finish
     const reply = done
       ? { content: JSON.parse(messages.at(-1).content) }
-      : { tool_calls: [{ id: 'lookup', type: 'function', function: { name: tool.name, arguments: '{}' } }] }
+      : { content: 'Looking up the result.', reasoning_content: 'Provider trace', tool_calls: [{ id: 'lookup', type: 'function', function: { name: tool.name, arguments: '{"name":"live-value"}' } }] }
     response.setHeader('Content-Type', 'application/json')
-    response.end(JSON.stringify({ id: 'test', object: 'chat.completion', created: 0, model: 'test', choices: [{ index: 0, finish_reason: done ? 'stop' : 'tool_calls', message: { role: 'assistant', ...reply } }] }))
+    response.end(JSON.stringify({ id: 'test', object: 'chat.completion', created: 0, model: 'test', choices: [{ index: 0, finish_reason: 'stop', message: { role: 'assistant', ...reply } }] }))
   })
   await new Promise<void>((resolve, reject) => provider.once('error', reject).listen(0, '127.0.0.1', resolve))
   try {
@@ -316,17 +321,36 @@ test('configure tools and follow their runs from an agent', async ({ page, reque
     expect(revision.runner_options).toMatchObject({ tool_function_ids: [tool.id], max_steps: null, max_tool_calls: 2 })
     await expect(dialog).not.toBeVisible()
 
-    const executed = await request.post(`/api/v1/functions/${agent.id}/run`, { data: {} })
-    expect(executed.ok()).toBeTruthy()
-    const runId = executed.headers()['x-run-id']
-    expect((await executed.json()).output).toBe('tool-result')
-    await page.goto(`/runs/${runId}`)
+    await run(page)
+    const comments = page.getByRole('heading', { name: 'Комментарии модели' }).locator('..')
+    await expect(comments).toContainText('Looking up the result.')
+    await expect(comments.getByText('Шаг 1', { exact: true })).toBeVisible()
+    await expect(comments.locator('time')).toHaveAttribute('datetime', /^\d{4}-\d{2}-\d{2}T/)
+    await expect(comments).not.toContainText('Provider trace')
+    const calls = page.getByRole('heading', { name: 'Вызовы инструментов' }).locator('..')
+    await expect(calls.getByText(tool.name, { exact: true })).toBeVisible()
+    await expect(calls.getByText('Шаг 1', { exact: true })).toBeVisible()
+    await expect(calls).toContainText('"name": "live-value"')
+    const metadata = page.getByText('Метаданные', { exact: true }).locator('../..')
+    await expect(metadata).toContainText('"tool_calls"')
+    await expect(metadata).toContainText('"assistant_comments"')
+    await expect(page.getByText('Hello, live-value!', { exact: true })).toHaveCount(0)
+    finishResponse()
+    await expect(page.getByText('Hello, live-value!', { exact: true })).toBeVisible()
+    await expect(comments).toContainText('Looking up the result.')
+    await expect(calls).toContainText('"name": "live-value"')
+    await expect(metadata).toContainText('"tool_calls"')
+    await expect(metadata).toContainText('"assistant_comments"')
+    const recordLink = page.getByRole('link', { name: 'Открыть запись запуска' })
+    const runPath = await recordLink.getAttribute('href')
+    await recordLink.click()
     await expect(page.getByRole('heading', { name: 'Вызовы инструментов' })).toBeVisible()
     const call = page.getByRole('row').filter({ hasText: tool.name })
     await expect(call).toBeVisible()
     await call.getByRole('link', { name: 'Открыть запуск' }).click()
-    await expect(page.getByRole('link', { name: runId, exact: true })).toHaveAttribute('href', `/runs/${runId}`)
+    await expect(page.getByRole('link', { name: runPath!.split('/').at(-1), exact: true })).toHaveAttribute('href', runPath!)
   } finally {
+    finishResponse()
     provider.closeAllConnections()
     await new Promise<void>((resolve, reject) => provider.close(error => error ? reject(error) : resolve()))
   }

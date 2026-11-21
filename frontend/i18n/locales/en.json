@@ -12,6 +12,8 @@
     "positiveInteger": "Enter a whole number greater than zero.",
     "nonNegativeInteger": "Enter a whole number greater than or equal to zero.",
     "toolCalls": "Tool calls",
+    "assistantComments": "Model comments",
+    "step": "Step {step}",
     "callOrder": "Call",
     "parentRun": "Parent run",
     "requiresAuthentication": "The current version uses tools and requires authentication and the functions.run permission."

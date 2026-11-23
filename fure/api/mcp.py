@@ -11,7 +11,7 @@ from fastmcp.server.providers import Provider
 from fastmcp.tools import Tool, ToolResult
 from pydantic import PrivateAttr
 
-from fure.api.v1.schemas.run import RunResponse
+from fure.api.v1.presenters import run_result_response
 from fure.core.auth import Permission, Principal
 from fure.core.function import Function
 from fure.database.repositories import FunctionRepository
@@ -82,7 +82,7 @@ class FunctionTool(Tool):
                 None if self._null_input else arguments,
                 principal=principal,
             )
-            result = RunResponse.model_validate(run).model_dump(mode="json")
+            result = run_result_response(run, principal).model_dump(mode="json")
             return ToolResult(structured_content={**result, "run_id": str(run.id)})
         except ServiceError as error:
             result = {"detail": str(error), "code": error.code}

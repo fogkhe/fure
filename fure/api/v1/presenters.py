@@ -1,7 +1,13 @@
 from dataclasses import replace
 
-from fure.api.v1.schemas import FunctionResponse, RevisionResponse, RunDetailResponse
+from fure.api.v1.schemas import (
+    FunctionResponse,
+    RevisionResponse,
+    RunDetailResponse,
+    RunResponse,
+)
 from fure.core.auth import Principal
+from fure.core.run import BaseRunMeta, Run
 from fure.core.runners.jinja.openai import OpenAIJinjaRunnerOptions
 from fure.database.mappers import implementation_to_data, options_to_data
 
@@ -44,7 +50,7 @@ def revision_response(revision):
     )
 
 
-def run_response(run, principal: Principal | None = None):
+def _visible_run_meta(run: Run, principal: Principal | None) -> BaseRunMeta | None:
     meta = run.meta
     if (
         meta is not None
@@ -60,6 +66,16 @@ def run_response(run, principal: Principal | None = None):
                 if principal.allows_function(call.function_id)
             ),
         )
+    return meta
+
+
+def run_result_response(run: Run, principal: Principal | None) -> RunResponse:
+    return RunResponse(
+        output=run.output, meta=_visible_run_meta(run, principal), duration=run.duration
+    )
+
+
+def run_response(run: Run, principal: Principal | None = None) -> RunDetailResponse:
     return RunDetailResponse(
         id=run.id,
         function_id=run.revision.function.id,
@@ -72,7 +88,7 @@ def run_response(run, principal: Principal | None = None):
         input=run.input,
         status=run.status,
         output=run.output,
-        meta=meta,
+        meta=_visible_run_meta(run, principal),
         duration=run.duration,
         started_at=run.started_at,
         finished_at=run.finished_at,

@@ -9,7 +9,10 @@ from uuid import UUID
 from jsonschema.exceptions import ValidationError
 from jsonschema.validators import validator_for
 from openai import AsyncOpenAI, Omit, omit
-from openai.types.chat import ChatCompletionMessageFunctionToolCall
+from openai.types.chat import (
+    ChatCompletionMessageFunctionToolCall,
+    ChatCompletionToolParam,
+)
 from openai.types.shared_params.response_format_json_schema import (
     ResponseFormatJSONSchema,
 )
@@ -75,6 +78,10 @@ class AgentLimitExceeded(RuntimeError):
     pass
 
 
+class InvalidToolResponse(RuntimeError):
+    pass
+
+
 async def _call_tool(
     call: ChatCompletionMessageFunctionToolCall,
     tools: dict[str, OpenAIJinjaTool],
@@ -92,7 +99,7 @@ async def _call_tool(
             null_input = tool.input_schema.get("type") == "null"
             schema = tool.parameters if null_input else tool.input_schema
             validator_for(schema)(schema, registry=Registry()).validate(arguments)
-        except TypeError, ValueError, ValidationError:
+        except RecursionError, TypeError, ValueError, ValidationError:
             output = {"error": {"code": "invalid_input"}}
         else:
             output = await tool.execute(None if null_input else arguments, index, step)
@@ -126,6 +133,12 @@ class OpenAIJinjaRunner(
         output_schema = implementation.output_schema
         json_output = bool(output_schema)
         structured_output = json_output and options.structured_outputs
+        schema_text = json.dumps(output_schema, ensure_ascii=False)
+        validator = None
+        if json_output:
+            validator_type = validator_for(output_schema)
+            validator_type.check_schema(output_schema)
+            validator = validator_type(output_schema, registry=Registry())
 
         response_format: ResponseFormatJSONSchema | Omit = omit
         if structured_output:
@@ -143,6 +156,11 @@ class OpenAIJinjaRunner(
         prompt = implementation.render(input, variables=variables)
 
         available = {tool.name: tool for tool in tools or ()}
+        format_after_tools = structured_output and bool(available)
+        if format_after_tools and options.max_steps == 1:
+            raise AgentLimitExceeded(
+                "Structured output with tools requires at least two model steps"
+            )
         instructions = []
         if available:
             instructions.append(
@@ -151,15 +169,21 @@ class OpenAIJinjaRunner(
                 "result or must happen after that tool finishes, request the "
                 "prerequisite first. Wait for its tool result before requesting "
                 "the dependent call in a later response. For a strictly ordered "
-                "sequence, request only the next call in each response."
+                "sequence, request only the next call in each response. Complete "
+                "all requested tool actions before writing your final answer."
             )
         if json_output:
             instruction = "The final output must conform to the schema."
-            if not structured_output:
+            if format_after_tools:
+                instruction += (
+                    " After completing the tool actions, provide a complete answer "
+                    "with the information needed by this JSON Schema.\n" + schema_text
+                )
+            elif not structured_output:
                 instruction = (
                     "Return exactly one JSON value matching this JSON Schema in your final response. "
                     "Do not include explanations or Markdown in the final response.\n"
-                    + json.dumps(output_schema, ensure_ascii=False)
+                    + schema_text
                 )
             instructions.append(instruction)
         messages = []
@@ -169,7 +193,7 @@ class OpenAIJinjaRunner(
             {"role": "user", "content": prompt},
         )
 
-        tool_definitions = [
+        tool_definitions: list[ChatCompletionToolParam] = [
             {
                 "type": "function",
                 "function": {
@@ -180,7 +204,6 @@ class OpenAIJinjaRunner(
             }
             for tool in available.values()
         ]
-        steps = 0
         call_count = 0
         seen_call_ids: set[str] = set()
         usages = []
@@ -190,21 +213,38 @@ class OpenAIJinjaRunner(
             base_url=options.base_url,
             timeout=options.timeout,
         ) as client:
-            while True:
+
+            async def complete(
+                request_messages,
+                *,
+                request_format: ResponseFormatJSONSchema | Omit,
+                request_tools: list[ChatCompletionToolParam] | Omit = omit,
+            ):
                 completion = await client.chat.completions.create(
                     model=options.model,
-                    messages=messages,
-                    response_format=response_format,
-                    tools=tool_definitions or omit,
+                    messages=request_messages,
+                    response_format=request_format,
+                    tools=request_tools,
                 )
-                steps += 1
                 usages.append(completion.usage)
                 if not completion.choices:
                     raise RuntimeError("Chat completion returned no choices")
-                choice = completion.choices[0]
+                return completion.choices[0]
+
+            while True:
+                choice = await complete(
+                    messages,
+                    request_format=omit if format_after_tools else response_format,
+                    request_tools=tool_definitions or omit,
+                )
                 message = choice.message
+                steps = len(usages)
                 calls = message.tool_calls or []
                 if not calls:
+                    if available and choice.finish_reason == "tool_calls":
+                        raise InvalidToolResponse(
+                            "Chat completion indicated tool calls but returned none"
+                        )
                     break
                 if (
                     not available
@@ -215,12 +255,21 @@ class OpenAIJinjaRunner(
                         for call in calls
                     )
                 ):
-                    raise RuntimeError("Chat completion returned invalid tool calls")
+                    raise InvalidToolResponse(
+                        "Chat completion returned invalid tool calls"
+                    )
                 ids = {call.id for call in calls}
                 if len(ids) != len(calls) or not all(ids) or ids & seen_call_ids:
-                    raise RuntimeError("Chat completion returned invalid tool call IDs")
+                    raise InvalidToolResponse(
+                        "Chat completion returned invalid tool call IDs"
+                    )
                 seen_call_ids.update(ids)
-                if options.max_steps is not None and steps >= options.max_steps:
+                # Reserve a reply after the batch and, when enabled, a formatting step.
+                steps_needed = 2 if format_after_tools else 1
+                if (
+                    options.max_steps is not None
+                    and steps + steps_needed > options.max_steps
+                ):
                     raise AgentLimitExceeded(
                         "Agent reached the maximum number of steps"
                     )
@@ -254,6 +303,35 @@ class OpenAIJinjaRunner(
                 messages.extend(task.result() for task in tasks)
                 call_count += len(calls)
 
+            if format_after_tools:
+                if message.refusal or choice.finish_reason != "stop":
+                    raise RuntimeError(
+                        "Chat completion did not finish the agent response"
+                    )
+                draft = strip_reasoning(
+                    message.content or "", options.reasoning_end_tags
+                )
+                if not draft:
+                    raise RuntimeError("Chat completion returned no text content")
+                choice = await complete(
+                    [
+                        {
+                            "role": "system",
+                            "content": (
+                                "Convert the supplied answer to this JSON Schema. "
+                                "Preserve its facts and values.\n" + schema_text
+                            ),
+                        },
+                        {"role": "user", "content": draft},
+                    ],
+                    request_format=response_format,
+                )
+                message = choice.message
+                if message.tool_calls:
+                    raise InvalidToolResponse(
+                        "Chat completion returned tool calls during output formatting"
+                    )
+
         if tools is not None and (message.refusal or choice.finish_reason != "stop"):
             raise RuntimeError("Chat completion did not finish the agent response")
         if json_output:
@@ -272,7 +350,7 @@ class OpenAIJinjaRunner(
             )
 
         output = content
-        if json_output:
+        if validator is not None:
             try:
                 output = (
                     parse_json(content)
@@ -283,13 +361,15 @@ class OpenAIJinjaRunner(
                 raise ValueError(
                     "Chat completion returned invalid JSON or multiple JSON values",
                 ) from error
-            validator_type = validator_for(output_schema)
-            validator_type.check_schema(output_schema)
-            validator_type(output_schema, registry=Registry()).validate(output)
+            validator.validate(output)
 
         def total(field):
             values = [getattr(usage, field) for usage in usages if usage is not None]
-            return sum(values) if len(values) == steps and None not in values else None
+            return (
+                sum(values)
+                if len(values) == len(usages) and None not in values
+                else None
+            )
 
         return RunResult(
             output=output,

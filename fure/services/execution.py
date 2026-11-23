@@ -27,7 +27,11 @@ from fure.core.runners import (
     OpenAIJinjaRunner,
     OpenAIJinjaRunnerOptions,
 )
-from fure.core.runners.jinja.openai import AgentLimitExceeded, OpenAIJinjaTool
+from fure.core.runners.jinja.openai import (
+    AgentLimitExceeded,
+    InvalidToolResponse,
+    OpenAIJinjaTool,
+)
 from fure.core.types import JSONValue
 from fure.database.connection import Database
 from fure.database.mappers import meta_to_data
@@ -157,7 +161,9 @@ class ExecutionService:
             )
             if function is None or function.deleted:
                 raise NotFound("Function not found or deleted")
-            require_function_access(principal, function.id)
+            # Tool invocations are selected from the running parent's revision.
+            if invocation is None:
+                require_function_access(principal, function.id)
             revision = (
                 invocation.revision if invocation is not None else function.revision
             )
@@ -253,13 +259,10 @@ class ExecutionService:
         ancestors: frozenset[UUID],
     ) -> tuple[OpenAIJinjaTool, ...]:
         ancestors = ancestors | {run.revision.function.id}
-        ids = tuple(
-            id for id in options.tool_function_ids if principal.allows_function(id)
-        )
-        if not ids:
-            return ()
         async with self.database.sessions() as session:
-            functions = await FunctionRepository(session).get_many(ids)
+            functions = await FunctionRepository(session).get_many(
+                options.tool_function_ids
+            )
         return tuple(
             OpenAIJinjaTool(
                 name=function.name,
@@ -452,6 +455,10 @@ class ExecutionService:
             elif isinstance(error, (TimeoutError, APITimeoutError)):
                 failure = ExecutionTimedOut(
                     "Execution timed out", code="timeout", run_id=run.id
+                )
+            elif isinstance(error, InvalidToolResponse):
+                failure = ProviderFailed(
+                    str(error), code="invalid_tool_response", run_id=run.id
                 )
             elif isinstance(error, APIError):
                 failure = ProviderFailed(

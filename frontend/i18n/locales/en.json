@@ -1,13 +1,13 @@
 {
   "agent": {
     "tools": "Tools",
-    "toolsDescription": "The model can call selected Fure functions within the caller’s permissions. Versions with tools require authentication.",
+    "toolsDescription": "Running this revision gives the model access to its selected Fure functions. An API key needs direct access to the agent to start it.",
     "chooseTools": "Choose tools ({count})",
     "removeTool": "Remove {name}",
     "maxSteps": "Maximum model steps",
     "maxToolCalls": "Maximum tool calls",
     "unlimited": "Unlimited",
-    "stepLimitDescription": "Counts every model request, including the final response. Leave blank for no limit.",
+    "stepLimitDescription": "Counts every model request, including the final answer and any separate Structured Outputs formatting. Leave blank for no limit.",
     "callLimitDescription": "Counts each tool call, including calls in the same batch. Leave blank for no limit.",
     "positiveInteger": "Enter a whole number greater than zero.",
     "nonNegativeInteger": "Enter a whole number greater than or equal to zero.",

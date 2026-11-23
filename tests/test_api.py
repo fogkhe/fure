@@ -689,10 +689,18 @@ class APITests(unittest.TestCase):
             return await run_python(runner, *args, **kwargs)
 
         async def respond(payload):
-            self.assertEqual(
-                payload["response_format"]["json_schema"]["schema"], schema
-            )
             messages = payload["messages"]
+            if "response_format" in payload:
+                self.assertEqual(
+                    payload["response_format"]["json_schema"]["schema"], schema
+                )
+                self.assertNotIn("tools", payload)
+                self.assertEqual(
+                    [message["role"] for message in messages], ["system", "user"]
+                )
+                self.assertEqual(messages[-1]["content"], "Both lookups completed.")
+                return {"content": '{"done":true}'}
+            self.assertIn("tools", payload)
             if messages[-1]["role"] == "user":
                 (system,) = (
                     message for message in messages if message["role"] == "system"
@@ -722,7 +730,7 @@ class APITests(unittest.TestCase):
                 [json.loads(message["content"]) for message in messages[-2:]],
                 ["original", "original"],
             )
-            return {"content": '{"done":true}'}
+            return {"content": "Both lookups completed."}
 
         with mock_chat(respond), patch.object(InlinePythonRunner, "run", parallel):
             response = self.client.post("/v1/run/agent", json={})
@@ -734,7 +742,7 @@ class APITests(unittest.TestCase):
         self.assertEqual((comment["text"], comment["step"]), ("Checking", 1))
         self.assertEqual(
             meta,
-            {"input_tokens": 8, "output_tokens": 4, "total_tokens": 12},
+            {"input_tokens": 12, "output_tokens": 6, "total_tokens": 18},
         )
         children = self.tool_runs(response.headers["X-Run-Id"])
         self.assertEqual([child["tool_call_index"] for child in children], [1, 2])
@@ -768,7 +776,7 @@ class APITests(unittest.TestCase):
         forbidden = self.function("forbidden", public=True)
         self.revision(allowed["id"])
         self.revision(forbidden["id"])
-        self.agent_revision(agent, [allowed, forbidden], structured_outputs=False)
+        self.agent_revision(agent, [allowed], structured_outputs=False)
         self.assertEqual(
             self.client.post(
                 "/v1/run/agent", json={}, headers={"cookie": ""}
@@ -779,10 +787,25 @@ class APITests(unittest.TestCase):
             "/v1/keys",
             json={
                 "name": "agent key",
-                "permissions": ["functions.run", "runs.read"],
-                "function_ids": [agent["id"], allowed["id"]],
+                "permissions": ["functions.read", "functions.run", "runs.read"],
+                "function_ids": [agent["id"]],
             },
         ).json()
+        headers = {"Authorization": f"Bearer {key['secret']}"}
+        for path in (
+            f"/v1/functions/{allowed['id']}/run",
+            "/v1/run/allowed",
+            "/v1/run/forbidden",
+        ):
+            self.assertEqual(
+                self.client.post(path, json={}, headers=headers).status_code, 404
+            )
+        self.assertEqual(
+            self.client.get(
+                f"/v1/functions/{allowed['id']}", headers=headers
+            ).status_code,
+            404,
+        )
 
         async def respond(payload):
             self.assertEqual(
@@ -796,13 +819,19 @@ class APITests(unittest.TestCase):
                     "tool_calls": [
                         tool_call("forbidden", 1),
                         tool_call("allowed", 2, '{"extra":true}'),
-                        tool_call("allowed", 3),
+                        tool_call(
+                            "allowed",
+                            3,
+                            '{"nested":' + "[" * 2000 + "0" + "]" * 2000 + "}",
+                        ),
+                        tool_call("allowed", 4),
                     ]
                 }
             self.assertEqual(
-                [json.loads(message["content"]) for message in messages[-3:]],
+                [json.loads(message["content"]) for message in messages[-4:]],
                 [
                     {"error": {"code": "tool_unavailable"}},
+                    {"error": {"code": "invalid_input"}},
                     {"error": {"code": "invalid_input"}},
                     "hello",
                 ],
@@ -813,26 +842,89 @@ class APITests(unittest.TestCase):
             response = self.client.post(
                 "/v1/run/agent",
                 json={},
-                headers={"Authorization": f"Bearer {key['secret']}"},
+                headers=headers,
             )
         self.assertEqual(response.status_code, 200, response.text)
         (child,) = self.tool_runs(response.headers["X-Run-Id"])
         self.assertEqual(child["function_id"], allowed["id"])
         self.assertEqual(child["api_key_id"], key["id"])
-        self.assertEqual(child["tool_call_index"], 3)
+        self.assertEqual(child["tool_call_index"], 4)
         run_id = response.headers["X-Run-Id"]
+        self.assertNotIn("tool_calls", response.json()["meta"])
         self.assertEqual(
-            [call["index"] for call in response.json()["meta"]["tool_calls"]], [3]
+            self.client.get(f"/v1/runs/{child['id']}", headers=headers).status_code, 404
         )
+        scoped_children = self.client.get(
+            "/v1/runs", params={"parent_run_id": run_id}, headers=headers
+        )
+        self.assertEqual(scoped_children.status_code, 200, scoped_children.text)
+        self.assertEqual(scoped_children.json()["items"], [])
         changed = self.client.patch(
-            f"/v1/keys/{key['id']}", json={"function_ids": [agent["id"]]}
+            f"/v1/keys/{key['id']}", json={"function_ids": [agent["id"], allowed["id"]]}
         )
         self.assertEqual(changed.status_code, 200, changed.text)
-        restricted = self.client.get(
-            f"/v1/runs/{run_id}", headers={"Authorization": f"Bearer {key['secret']}"}
-        )
+        restricted = self.client.get(f"/v1/runs/{run_id}", headers=headers)
         self.assertEqual(restricted.status_code, 200, restricted.text)
-        self.assertNotIn("tool_calls", restricted.json()["meta"])
+        self.assertEqual(
+            [call["index"] for call in restricted.json()["meta"]["tool_calls"]], [4]
+        )
+
+    def test_mcp_key_can_run_agent_with_nested_tools_outside_direct_scope(self):
+        outer = self.function("outer")
+        inner = self.function("inner")
+        tool = self.function("lookup")
+        self.revision(tool["id"])
+        self.agent_revision(inner, [tool])
+        self.agent_revision(outer, [inner])
+        key = self.client.post(
+            "/v1/keys",
+            json={
+                "name": "outer only",
+                "permissions": ["mcp.access", "functions.read", "functions.run"],
+                "function_ids": [outer["id"]],
+            },
+        ).json()
+
+        def rpc(method, params):
+            response = self.client.post(
+                "/mcp/",
+                headers={
+                    "Authorization": f"Bearer {key['secret']}",
+                    "Accept": "application/json, text/event-stream",
+                    "MCP-Protocol-Version": "2025-11-25",
+                },
+                json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
+            )
+            self.assertEqual(response.status_code, 200, response.text)
+            return response.json()["result"]
+
+        async def respond(payload):
+            message = payload["messages"][-1]
+            if message["role"] == "tool":
+                return {"content": json.loads(message["content"])}
+            target = {"outer": "inner", "inner": "lookup"}[message["content"]]
+            self.assertEqual(
+                [tool["function"]["name"] for tool in payload["tools"]], [target]
+            )
+            return {"tool_calls": [tool_call(target, 1)]}
+
+        self.assertEqual(
+            [tool["name"] for tool in rpc("tools/list", {})["tools"]], ["outer"]
+        )
+        self.assertTrue(
+            rpc("tools/call", {"name": "inner", "arguments": {}})["isError"]
+        )
+        with mock_chat(respond):
+            result = rpc("tools/call", {"name": "outer", "arguments": {}})
+        self.assertFalse(result.get("isError", False), result)
+        data = result["structuredContent"]
+        self.assertEqual(data["output"], "hello")
+        self.assertNotIn("tool_calls", data["meta"])
+        (child,) = self.tool_runs(data["run_id"])
+        (grandchild,) = self.tool_runs(child["id"])
+        self.assertEqual(
+            (child["function_id"], grandchild["function_id"]), (inner["id"], tool["id"])
+        )
 
     def test_agent_limits_reject_a_batch_before_running_tools(self):
         agent = self.function("agent")
@@ -842,7 +934,11 @@ class APITests(unittest.TestCase):
         async def respond(_payload):
             return {"tool_calls": [tool_call("tool", 1), tool_call("tool", 2)]}
 
-        for limits in ({"max_steps": 1}, {"max_tool_calls": 1}):
+        for limits in (
+            {"max_steps": 1},
+            {"max_tool_calls": 1},
+            {"max_steps": 2, "output_schema": {"type": "object"}},
+        ):
             with self.subTest(limits=limits), mock_chat(respond):
                 self.agent_revision(agent, [tool], **limits)
                 response = self.client.post("/v1/run/agent", json={})
@@ -853,6 +949,47 @@ class APITests(unittest.TestCase):
                     "agent_limit_exceeded",
                 )
                 self.assertEqual(self.tool_runs(run_id), [])
+
+    def test_invalid_agent_output_schema_fails_before_tool_execution(self):
+        agent = self.function("agent")
+        tool = self.function("tool")
+        self.revision(tool["id"])
+        self.agent_revision(agent, [tool], output_schema={"type": "invalid"})
+        requests = []
+
+        async def respond(payload):
+            requests.append(payload)
+            return {"content": "{}"}
+
+        with mock_chat(respond):
+            response = self.client.post("/v1/run/agent", json={})
+        self.assertEqual(response.status_code, 500, response.text)
+        self.assertEqual(requests, [])
+        self.assertEqual(self.tool_runs(response.headers["X-Run-Id"]), [])
+
+    def test_agent_does_not_execute_tools_from_the_formatting_response(self):
+        agent = self.function("agent")
+        tool = self.function("tool")
+        self.revision(tool["id"])
+        self.agent_revision(
+            agent, [tool], output_schema={"type": "object"}, max_steps=3
+        )
+
+        async def respond(payload):
+            if "response_format" in payload:
+                return {"tool_calls": [tool_call("tool", 2)]}
+            if payload["messages"][-1]["role"] == "tool":
+                return {"content": "Tool completed."}
+            return {"tool_calls": [tool_call("tool", 1)]}
+
+        with mock_chat(respond):
+            response = self.client.post("/v1/run/agent", json={})
+        self.assertEqual(response.status_code, 502, response.text)
+        run_id = response.headers["X-Run-Id"]
+        parent = self.client.get(f"/v1/runs/{run_id}").json()
+        self.assertEqual(parent["meta"]["code"], "invalid_tool_response")
+        (child,) = self.tool_runs(run_id)
+        self.assertEqual(child["status"], "succeeded")
 
     def test_agent_cancellation_cascades_through_nested_agents(self):
         outer = self.function("outer")

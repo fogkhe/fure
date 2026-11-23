@@ -96,8 +96,9 @@ execution by UUID or name, and run-history reads/cancellation. Out-of-scope dire
 requests return 404; lists and pagination totals contain only accessible records.
 Public functions do not bypass restrictions or `functions.run` for a supplied API key.
 Revisions with [agent tools](api.md#agent-runs) require authentication, including
-on the public REST alias. An MCP key must include each function it wants an agent
-to access in addition to the agent itself.
+on the public REST alias. Selecting an agent in the key grants the ability to
+run it with the tools configured in its revision. Direct discovery and tool calls
+through MCP still use the key's explicit selection.
 
 ## Upgrade
 

@@ -94,6 +94,8 @@ Keys additionally have an explicit `function_ids` selection, empty by default.
 There is no wildcard mode. The selection restricts REST and MCP access to functions,
 their revisions and their history. Out-of-scope records return 404 and are excluded
 from lists and totals. A public function does not bypass a key's scope or run permission.
+A selected [agent](api.md#agent-runs) can invoke the tools configured in its active
+revision during a run. Direct tool access still requires selection in the key.
 `PATCH /v1/keys/{key_id}` with `{"function_ids": [...]}` replaces an active key's
 selection without changing its secret; changes apply to subsequent requests.
 Child-key creation and scope edits cannot grant functions beyond the requesting key's

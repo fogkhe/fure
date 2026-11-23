@@ -63,9 +63,12 @@ duration of that agent run. Nested agents work as tools. A branch cannot invoke
 a function already on that branch.
 
 Launching a version with tools requires authentication and `functions.run`.
-An API key can only expose tools within its function selection. Disabled and
-deleted functions drop out of tool discovery, and their status is checked again
-at execution. A tool's result or an error code goes back to the model.
+Select the agent in the API key's function list to launch it. During that run,
+each agent uses the tools configured in its revision, including functions outside
+the key's direct selection. The key's selection still governs direct launches,
+catalogue access and history access. Disabled and deleted functions drop out of
+tool discovery, and their status is checked again at execution. A tool's result
+or an error code goes back to the model.
 
 Calls in the same model response execute in parallel. `max_steps` defaults to
 8 and counts model requests including the final response. `max_tool_calls`
@@ -74,6 +77,12 @@ batch and invalid calls. Both settings apply per agent run and accept `null`
 for no limit. A batch that would exceed a limit fails before execution with
 `agent_limit_exceeded`. The runner timeout covers the whole agent run and
 cancellation propagates to active descendants.
+
+When Structured Outputs and tools are enabled, model requests during the tool
+loop carry tool definitions. Once the model finishes the loop, a separate
+request formats its answer using the output schema. This formatting request
+counts toward `max_steps`. For providers without native Structured Outputs,
+set `structured_outputs` to `false` to extract and validate the final JSON locally.
 
 The REST result is the final text or JSON. Token counts cover all model
 requests made directly by that agent. Each executed tool has a run record with

@@ -4,7 +4,7 @@ from uuid import UUID
 from fastapi import Query, Response
 from fastapi.responses import JSONResponse
 
-from fure.api.v1.presenters import run_response
+from fure.api.v1.presenters import run_response, run_result_response
 from fure.api.v1.schemas import (
     ErrorResponse,
     RunDetailResponse,
@@ -78,9 +78,9 @@ async def execute_function(
         run = await service.submit(function, request.input, principal=principal)
         return JSONResponse(
             status_code=202,
-            content=run_response(run).model_dump(mode="json"),
+            content=run_response(run, principal).model_dump(mode="json"),
             headers={"X-Run-Id": str(run.id)},
         )
     run = await service.execute(function, request.input, principal=principal)
     response.headers["X-Run-Id"] = str(run.id)
-    return RunResponse.model_validate(run)
+    return run_result_response(run, principal)
